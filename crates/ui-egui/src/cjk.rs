@@ -1,7 +1,7 @@
 //! Chinese fallback fonts for document text in the interface, independent of UI language.
 //! Optional craft-fonts are preferred; native builds without them reuse one installed face.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{FontData, FontDefinitions, FontFamily};
 
@@ -28,24 +28,41 @@ pub(crate) fn craft_fonts() -> impl Iterator<Item = &'static filmcraft_text::fon
 const KOREAN_SAMPLE: &str = "한국어입력테스트";
 const KOREAN_PREFERRED: &[&str] = &["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans K", "NanumGothic"];
 
+/// A fallback face, looked up again only when the font database has changed (fonts registered at
+/// runtime, e.g. by a host page on the web, which has no system fonts to scan).
+type Cached = Mutex<Option<(u64, Option<Arc<FontData>>)>>;
+
+fn cached(cache: &Cached, sample: &str, preferred: &[&str]) -> Option<Arc<FontData>> {
+    if !cfg!(target_arch = "wasm32") {
+        filmcraft_text::fonts::scan_system();
+    }
+    let generation = filmcraft_text::fonts::generation();
+    let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((g, font)) = c.as_ref()
+        && *g == generation
+    {
+        return font.clone();
+    }
+    let font = find_installed_font(sample, preferred);
+    *c = Some((generation, font.clone()));
+    font
+}
+
 fn system_font() -> Option<Arc<FontData>> {
-    static FONT: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
-    FONT.get_or_init(|| find_system_font(SAMPLE, PREFERRED)).clone()
+    static FONT: Cached = Mutex::new(None);
+    cached(&FONT, SAMPLE, PREFERRED)
 }
 
 fn korean_font() -> Option<Arc<FontData>> {
-    static FONT: OnceLock<Option<Arc<FontData>>> = OnceLock::new();
-    FONT.get_or_init(|| find_system_font(KOREAN_SAMPLE, KOREAN_PREFERRED)).clone()
+    static FONT: Cached = Mutex::new(None);
+    cached(&FONT, KOREAN_SAMPLE, KOREAN_PREFERRED)
 }
 
+/// An installed face (system font, or one registered at runtime) covering `sample`.
 /// A font collection's face index matters: Windows CJK UI fonts commonly live in TTC files.
 /// Keep the owned bytes behind an Arc so theme reinstalls do not reread or leak a font file.
-fn find_system_font(sample: &str, preferred: &[&str]) -> Option<Arc<FontData>> {
-    if cfg!(target_arch = "wasm32") {
-        return None;
-    }
-    filmcraft_text::fonts::scan_system();
-    let faces: Vec<_> = filmcraft_text::fonts::all_faces().into_iter().filter(|f| f.info.origin == "system" && !f.info.italic).collect();
+fn find_installed_font(sample: &str, preferred: &[&str]) -> Option<Arc<FontData>> {
+    let faces: Vec<_> = filmcraft_text::fonts::all_faces().into_iter().filter(|f| matches!(f.info.origin, "system" | "user") && !f.info.italic).collect();
     let covers = |f: &filmcraft_text::fonts::Face| f.covers_text(sample);
     let by_weight = |f: &&Arc<filmcraft_text::fonts::Face>| f.info.weight.abs_diff(400);
     let found = preferred.iter().find_map(|name| faces.iter().filter(|f| f.info.family.eq_ignore_ascii_case(name) && covers(f)).min_by_key(by_weight));
@@ -53,7 +70,8 @@ fn find_system_font(sample: &str, preferred: &[&str]) -> Option<Arc<FontData>> {
     Some(Arc::new(FontData { font: std::borrow::Cow::Owned(face.data()?), index: face.info.index, tweak: Default::default() }))
 }
 
-/// Whether [`install`] has a Hangul face to add (an installed system face; none is bundled).
+/// Whether [`install`] has a Hangul face to add (an installed system face, or one registered at
+/// runtime; none is bundled).
 /// The Korean interface needs one.
 pub(crate) fn korean_available() -> bool {
     korean_font().is_some()
