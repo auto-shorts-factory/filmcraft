@@ -305,7 +305,18 @@ fn db() -> &'static RwLock<Db> {
 fn push(db: &mut Db, info: FaceInfo) -> FaceId {
     let id = db.faces.len();
     db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new() }));
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     id
+}
+
+/// Bumped whenever a face is added (system scan, [`add_font_data`], templates with fonts).
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Changes whenever faces are added to the database, so caches built from it (interface font
+/// fallbacks) know to rebuild. Fonts registered at runtime matter most on the web, where there are
+/// no system fonts to scan.
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Add faces from a source (skipping family+style pairs already present). Returns how many were
@@ -513,6 +524,18 @@ mod tests {
         // Inter Bold Italic: nearest is Italic (400) → synth bold
         let bi = resolve("Inter", "Bold Italic");
         assert!(face(bi.face).info.italic && bi.synth_bold && !bi.synth_italic);
+    }
+
+    /// Interface font caches key on the generation: a face registered at runtime must change it.
+    #[test]
+    fn registering_a_face_bumps_the_generation() {
+        let inter = resolve("Inter", "Regular");
+        let bytes = face(inter.face).data().expect("bundled Inter bytes");
+        let before = generation();
+        let added = add_font_data(bytes);
+        assert!(!added.is_empty());
+        assert!(generation() >= before + added.len() as u64);
+        assert!(add_font_data(b"not a font".to_vec()).is_empty());
     }
 
     #[test]
